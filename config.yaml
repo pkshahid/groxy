@@ -1,0 +1,12 @@
+server:
+  port: 8088
+  tls:
+    enabled: false
+    cert_file: "tls/cert.pem"
+    key_file: "tls/key.pem"
+
+load_balancer:
+  strategy: "round-robin"
+  backends:
+    - "http://localhost:8000"
+    - "http://localhost:8008"
