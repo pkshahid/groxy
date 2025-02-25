@@ -6,7 +6,7 @@ server:
     key_file: "tls/key.pem"
 
 load_balancer:
-  strategy: "round-robin"
+  strategy: "least-connections"  # Options: round-robin, least-connections, ip-hash
   backends:
     - "http://localhost:8000"
     - "http://localhost:8008"

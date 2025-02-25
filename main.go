@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"groxy/middleware"
 	"groxy/proxy"
 	"groxy/utils"
@@ -15,8 +14,7 @@ func main() {
 	config := utils.LoadConfig()
 
 	// Initialize Load Balancer
-	fmt.Println(config.LoadBalancer.Backends)
-	lb := proxy.NewLoadBalancer(config.LoadBalancer.Backends)
+	lb := proxy.NewLoadBalancer(config.LoadBalancer.Backends, config.LoadBalancer.Strategy)
 
 	// Define HTTP Server
 	mux := http.NewServeMux()

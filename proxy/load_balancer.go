@@ -1,9 +1,12 @@
 package proxy
 
 import (
-	"io"
+	
 	"log"
+	"hash/fnv"
+	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -12,10 +15,13 @@ type LoadBalancer struct {
 	backends    []string
 	counter     uint64
 	healthCheck map[string]*atomic.Bool
+	strategy   string
+	connCounts map[string]*int64
+	mu         sync.Mutex
 }
 
 // NewLoadBalancer initializes a load balancer with backends
-func NewLoadBalancer(backends []string) *LoadBalancer {
+func NewLoadBalancer(backends []string, strategy string) *LoadBalancer {
 	var urls []string
 	healthCheck := make(map[string]*atomic.Bool)
 
@@ -28,6 +34,13 @@ func NewLoadBalancer(backends []string) *LoadBalancer {
 	lb := &LoadBalancer{
 		backends:    urls,
 		healthCheck: healthCheck,
+		strategy:   strategy,
+		connCounts:  make(map[string]*int64),
+	}
+
+	for _, backend := range urls {
+		var count int64
+		lb.connCounts[backend] = &count
 	}
 
 	// Start periodic health checks
@@ -64,12 +77,27 @@ func (lb *LoadBalancer) startHealthCheck() {
 }
 
 // NextBackend returns the next backend using round-robin strategy
-func (lb *LoadBalancer) NextBackend() string {
+func (lb *LoadBalancer) NextBackend(r *http.Request) string {
 	totalBackends := len(lb.backends)
 	if totalBackends == 0 {
 		log.Println("No backends available")
 		return "" // or handle error gracefully
 	}
+
+	switch lb.strategy {
+	case "least-connections":
+		return lb.LeastConnectionsBackend()
+	case "ip-hash":
+		return lb.IPHashBackend(r)
+	default:
+		return lb.RoundRobinBackend()
+	}
+	return "" // No healthy backends available
+}
+
+// RoundRobinBackend selects backends in order
+func (lb *LoadBalancer) RoundRobinBackend() string {
+	totalBackends := len(lb.backends)
 	for i := 0; i < totalBackends; i++ {
 		idx := atomic.AddUint64(&lb.counter, 1) % uint64(totalBackends)
 		backend := lb.backends[idx]
@@ -79,40 +107,47 @@ func (lb *LoadBalancer) NextBackend() string {
 			return backend
 		}
 	}
-	return "" // No healthy backends available
+	return ""
+}
+
+// LeastConnectionsBackend selects backend with fewest connections
+func (lb *LoadBalancer) LeastConnectionsBackend() string {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	var selected string
+	var minConnections int64 = 1<<63 - 1
+
+	for backend, count := range lb.connCounts {
+		if *count < minConnections {
+			minConnections = *count
+			selected = backend
+		}
+	}
+	return selected
+}
+
+// IPHashBackend selects backend based on client IP
+func (lb *LoadBalancer) IPHashBackend(r *http.Request) string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr // Fallback if error occurs
+	}
+
+	hasher := fnv.New32a()
+	hasher.Write([]byte(ip))
+	index := hasher.Sum32() % uint32(len(lb.backends))
+	return lb.backends[index]
 }
 
 // ServeHTTP forwards requests to the selected backend
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	for attempt := 0; attempt < len(lb.backends); attempt++ {
-		backend := lb.NextBackend()
-		if backend == "" {
-			http.Error(w, "No healthy backends available", http.StatusServiceUnavailable)
-			return
-		}
+	backend := lb.NextBackend(r)
 
-		proxyReq, err := http.NewRequest(r.Method, backend+r.RequestURI, r.Body)
-		if err != nil {
-			log.Println("Error creating proxy request:", err)
-			continue
-		}
-		proxyReq.Header = r.Header
+	// Increment connection count
+	atomic.AddInt64(lb.connCounts[backend], 1)
+	defer atomic.AddInt64(lb.connCounts[backend], -1)
 
-		client := &http.Client{Timeout: 3 * time.Second} // Backend timeout
-		resp, err := client.Do(proxyReq)
-		if err != nil {
-			log.Printf("[Failover] Backend %s failed, trying next...\n", backend)
-			lb.healthCheck[backend].Store(false) // Mark backend as down immediately
-			continue                             // Try next backend
-		}
+	ReverseProxy(backend).ServeHTTP(w, r)
 
-		// Forward response
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		resp.Body.Close()
-		return
-	}
-
-	// No backend succeeded
-	http.Error(w, "All backends failed", http.StatusServiceUnavailable)
 }
